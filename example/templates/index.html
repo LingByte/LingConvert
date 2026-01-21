@@ -1,0 +1,191 @@
+<!doctype html>
+<html lang="zh">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>ffprobe 解析 Demo</title>
+    <style>
+        body { font-family: -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial; margin: 24px; }
+        .box { max-width: 1080px; margin: 0 auto; }
+        .card { border: 1px solid #ddd; border-radius: 12px; padding: 16px; margin-top: 16px; }
+        .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+        button { padding: 10px 14px; border-radius: 10px; border: 1px solid #333; background: #111; color:#fff; cursor: pointer; }
+        input[type=file], input[type=text], input[type=number] { padding: 10px; border-radius: 10px; border:1px solid #ccc; }
+        input[type=text] { flex: 1; min-width: 320px; }
+        .meta { color:#666; font-size: 14px; }
+        .err { color: #b00020; font-weight: 700; white-space: pre-wrap; }
+        pre { white-space: pre-wrap; word-break: break-word; background: #0b0b0b; color: #eaeaea; padding: 12px; border-radius: 10px; overflow:auto; }
+
+        .t { width:100%; border-collapse: collapse; }
+        .t th { text-align:left; width: 180px; padding: 10px; background:#fafafa; border:1px solid #eee; }
+        .t td { padding: 10px; border:1px solid #eee; vertical-align: top; }
+
+        .pill { display:inline-block; padding: 3px 8px; border-radius: 999px; background:#f1f1f1; font-size:12px; margin-left:8px; }
+        .tip { font-size: 13px; color:#444; line-height: 1.5; margin-top: 6px; }
+        .opt { display:flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+        .opt label { display:flex; gap:6px; align-items: center; }
+        .sub { margin-top: 8px; padding: 10px; border: 1px dashed #ddd; border-radius: 10px; }
+    </style>
+</head>
+<body>
+<div class="box">
+    <h1>ffprobe 解析 Demo</h1>
+    <div class="meta">支持上传文件或输入远程 URL（默认仅 http/https）。可选开启帧级/包级/章节/节目等高级信息。</div>
+
+    <div class="card">
+        <form action="/probe" method="post" enctype="multipart/form-data">
+            <div class="row">
+                <div>
+                    <div class="meta">上传本地文件</div>
+                    <input type="file" name="file" />
+                </div>
+
+                <div style="flex:1">
+                    <div class="meta">或输入远程 URL</div>
+                    <input type="text" name="url" placeholder="https://example.com/video.mp4" />
+                </div>
+
+                <button type="submit">开始解析</button>
+            </div>
+
+            <div class="sub">
+                <div class="meta">高级功能（可选，勾选越多越慢，frames/packets 输出可能很大）</div>
+
+                <div class="opt">
+                    <label><input type="checkbox" name="enable_frames">帧级 frames</label>
+                    <label><input type="checkbox" name="frames_keyonly">只取关键帧（视频 I 帧）</label>
+                    <label>stream：
+                        <input type="text" name="frames_streams" placeholder="v:0 / a:0（留空=全部）" style="width:220px">
+                    </label>
+                    <label>时间段：
+                        <input type="text" name="frames_intervals" placeholder="0%+3（从0秒取3秒）" style="width:220px">
+                    </label>
+                    <label>最多帧数：
+                        <input type="number" name="frames_limit" value="300" min="1" style="width:120px">
+                    </label>
+                </div>
+
+                <div class="opt">
+                    <label><input type="checkbox" name="enable_packets">包级 packets</label>
+                    <label>stream：
+                        <input type="text" name="packets_streams" placeholder="v:0 / a:0（留空=全部）" style="width:220px">
+                    </label>
+                    <label>最多包数：
+                        <input type="number" name="packets_limit" value="200" min="1" style="width:120px">
+                    </label>
+                </div>
+
+                <div class="opt">
+                    <label><input type="checkbox" name="enable_chapters">章节 chapters</label>
+                    <label><input type="checkbox" name="enable_programs">节目 programs（TS 常用）</label>
+                </div>
+            </div>
+
+            <div class="meta" style="margin-top:10px">
+                提示：如果同时上传文件和填写 URL，将优先解析上传文件。
+            </div>
+        </form>
+    </div>
+
+    {{ if .Error }}
+    <div class="card">
+        <div class="err">错误/提示：{{ .Error }}</div>
+    </div>
+    {{ end }}
+
+    {{ if .OK }}
+    <div class="card">
+        <div class="meta">{{ .View.Source }} <span class="pill">ffprobe 版本：{{ .View.FFVersion }}</span></div>
+
+        <h3>基础信息</h3>
+        <table class="t">
+            <tr><th>容器格式</th><td>{{ .View.Container }}</td></tr>
+            <tr><th>时长</th><td>{{ humanDuration .View.DurationSec }}</td></tr>
+            <tr><th>文件大小</th><td>{{ humanSize .View.SizeBytes }}</td></tr>
+            <tr>
+                <th>总码率</th>
+                <td>
+                    {{ humanBitrate .View.TotalBitrate }}
+                    <div class="tip">码率=每秒数据量。码率越高通常越清晰，但文件更大、带宽要求更高。</div>
+                </td>
+            </tr>
+        </table>
+    </div>
+
+    {{ if .View.Video }}
+    <div class="card">
+        <h3>视频信息</h3>
+        <table class="t">
+            <tr><th>编码格式</th><td>{{ .View.Video.Codec }}{{ if .View.Video.Profile }}（{{ .View.Video.Profile }}）{{ end }}</td></tr>
+            <tr><th>分辨率</th><td>{{ .View.Video.Resolution }}</td></tr>
+            <tr><th>帧率</th><td>{{ .View.Video.FPSLabel }}</td></tr>
+            <tr><th>像素格式</th><td>{{ .View.Video.PixFmt }}</td></tr>
+            <tr><th>视频码率</th><td>{{ humanBitrate .View.Video.Bitrate }}</td></tr>
+        </table>
+    </div>
+    {{ end }}
+
+    {{ if .View.Audio }}
+    <div class="card">
+        <h3>音频信息</h3>
+        <table class="t">
+            <tr><th>编码格式</th><td>{{ .View.Audio.Codec }}{{ if .View.Audio.Profile }}（{{ .View.Audio.Profile }}）{{ end }}</td></tr>
+            <tr><th>采样率</th><td>{{ .View.Audio.SampleRate }} Hz</td></tr>
+            <tr><th>声道</th><td>{{ .View.Audio.Channels }}（{{ .View.Audio.Layout }}）</td></tr>
+            <tr><th>音频码率</th><td>{{ humanBitrate .View.Audio.Bitrate }}</td></tr>
+        </table>
+    </div>
+    {{ end }}
+
+    {{ if .Advanced }}
+    <div class="card">
+        <h3>高级信息概览</h3>
+        <table class="t">
+            <tr><th>Frames</th><td>{{ .Advanced.FramesSummary }}</td></tr>
+            <tr><th>Packets</th><td>{{ .Advanced.PacketsSummary }}</td></tr>
+            <tr><th>Chapters</th><td>{{ .Advanced.ChaptersSummary }}</td></tr>
+            <tr><th>Programs</th><td>{{ .Advanced.ProgramsSummary }}</td></tr>
+        </table>
+    </div>
+    {{ end }}
+
+    <div class="card">
+        <h3>原始 JSON（调试用）</h3>
+
+        <details open>
+            <summary>基础（format + streams）</summary>
+            <pre>{{ .RawBaseJSON }}</pre>
+        </details>
+
+        {{ if .RawFramesJSON }}
+        <details>
+            <summary>Frames</summary>
+            <pre>{{ .RawFramesJSON }}</pre>
+        </details>
+        {{ end }}
+
+        {{ if .RawPacketsJSON }}
+        <details>
+            <summary>Packets</summary>
+            <pre>{{ .RawPacketsJSON }}</pre>
+        </details>
+        {{ end }}
+
+        {{ if .RawChaptersJSON }}
+        <details>
+            <summary>Chapters</summary>
+            <pre>{{ .RawChaptersJSON }}</pre>
+        </details>
+        {{ end }}
+
+        {{ if .RawProgramsJSON }}
+        <details>
+            <summary>Programs</summary>
+            <pre>{{ .RawProgramsJSON }}</pre>
+        </details>
+        {{ end }}
+    </div>
+    {{ end }}
+</div>
+</body>
+</html>
