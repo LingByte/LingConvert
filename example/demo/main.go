@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,11 +17,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/LingByte/LingConvert/media/ffmpeg"
+	"github.com/LingByte/LingConvert/media/ffprobe"
 	"github.com/gin-gonic/gin"
-
-	media "github.com/LingByte/LingConvert"
 )
 
 type PageData struct {
@@ -34,6 +37,13 @@ type PageData struct {
 	RawPacketsJSON  string
 	RawChaptersJSON string
 	RawProgramsJSON string
+
+	FFJob *JobView // 新增：ffmpeg job
+}
+
+type JobView struct {
+	ID     string
+	Status string
 }
 
 type ProbeView struct {
@@ -73,6 +83,99 @@ type AdvancedView struct {
 	ProgramsSummary string
 }
 
+// --------------------- ffmpeg Job 管理（内存任务表 + SSE 广播）---------------------
+
+type sseEvent struct {
+	Event string
+	Data  string
+}
+
+type FFJob struct {
+	ID        string
+	Status    string // created/running/done/error
+	CreatedAt time.Time
+
+	InputPath    string
+	InputDesc    string
+	InputCleanup func()
+
+	OutputPath string
+	OutputName string
+
+	ErrText string
+
+	mu   sync.Mutex
+	subs map[chan sseEvent]struct{}
+}
+
+type JobStore struct {
+	mu   sync.Mutex
+	jobs map[string]*FFJob
+}
+
+func NewJobStore() *JobStore {
+	return &JobStore{jobs: map[string]*FFJob{}}
+}
+
+func (s *JobStore) Put(j *FFJob) {
+	s.mu.Lock()
+	s.jobs[j.ID] = j
+	s.mu.Unlock()
+}
+
+func (s *JobStore) Get(id string) (*FFJob, bool) {
+	s.mu.Lock()
+	j, ok := s.jobs[id]
+	s.mu.Unlock()
+	return j, ok
+}
+
+func (s *JobStore) Delete(id string) {
+	s.mu.Lock()
+	delete(s.jobs, id)
+	s.mu.Unlock()
+}
+
+func newID() string {
+	b := make([]byte, 16)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (j *FFJob) subscribe() chan sseEvent {
+	ch := make(chan sseEvent, 16)
+	j.mu.Lock()
+	if j.subs == nil {
+		j.subs = map[chan sseEvent]struct{}{}
+	}
+	j.subs[ch] = struct{}{}
+	j.mu.Unlock()
+	return ch
+}
+
+func (j *FFJob) unsubscribe(ch chan sseEvent) {
+	j.mu.Lock()
+	if j.subs != nil {
+		delete(j.subs, ch)
+	}
+	j.mu.Unlock()
+	close(ch)
+}
+
+func (j *FFJob) broadcast(ev sseEvent) {
+	j.mu.Lock()
+	for ch := range j.subs {
+		select {
+		case ch <- ev:
+		default:
+			// slow subscriber -> drop
+		}
+	}
+	j.mu.Unlock()
+}
+
+// --------------------- main ---------------------
+
 func main() {
 	r := gin.Default()
 
@@ -84,16 +187,24 @@ func main() {
 	})
 	r.LoadHTMLGlob("templates/*.html")
 
-	tool := media.NewDefaultTool()
-	tool.Timeout = 25 * time.Second
+	// ffprobe tool
+	probeTool := ffprobe.NewDefaultTool()
+	probeTool.Timeout = 25 * time.Second
+
+	// ffmpeg tool
+	ffTool := ffmpeg.NewDefaultFFmpeg()
+	// ffmpeg 默认不建议死超时；如需限制可设置 ffTool.Timeout = 10*time.Minute 等
+	// ffTool.Timeout = 0
+
+	jobs := NewJobStore()
 
 	r.GET("/", func(c *gin.Context) {
 		c.HTML(http.StatusOK, "index.html", PageData{})
 	})
 
-	// 页面入口：上传 or URL + 选项
+	// --------------------- ffprobe 页面入口：上传 or URL + 选项 ---------------------
 	r.POST("/probe", func(c *gin.Context) {
-		ctx, cancel := context.WithTimeout(context.Background(), tool.Timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), probeTool.Timeout)
 		defer cancel()
 
 		// 输入源：上传优先
@@ -107,13 +218,13 @@ func main() {
 		}
 
 		// 解析基础信息
-		base, err := tool.Probe(ctx, input)
+		base, err := probeTool.Probe(ctx, input)
 		if err != nil {
 			c.HTML(http.StatusInternalServerError, "index.html", PageData{OK: false, Error: "ffprobe 基础解析失败: " + err.Error()})
 			return
 		}
 
-		ver, _ := tool.Version(ctx)
+		ver, _ := probeTool.Version(ctx)
 		view := buildProbeView(base, desc, ver)
 
 		rawBase, _ := json.MarshalIndent(base, "", "  ")
@@ -130,7 +241,7 @@ func main() {
 
 		// 高级：Frames
 		if opt.EnableFrames {
-			frames, err := tool.ProbeFrames(ctx, input, opt.FramesSelectStreams, opt.FramesReadIntervals)
+			frames, err := probeTool.ProbeFrames(ctx, input, opt.FramesSelectStreams, opt.FramesReadIntervals)
 			if err != nil {
 				data.Error = appendErr(data.Error, "frames 解析失败: "+err.Error())
 			} else {
@@ -148,7 +259,7 @@ func main() {
 
 		// 高级：Packets
 		if opt.EnablePackets {
-			pkts, err := tool.ProbePackets(ctx, input, opt.PacketsSelectStreams)
+			pkts, err := probeTool.ProbePackets(ctx, input, opt.PacketsSelectStreams)
 			if err != nil {
 				data.Error = appendErr(data.Error, "packets 解析失败: "+err.Error())
 			} else {
@@ -163,7 +274,7 @@ func main() {
 
 		// 高级：Chapters
 		if opt.EnableChapters {
-			chs, err := tool.ProbeChapters(ctx, input)
+			chs, err := probeTool.ProbeChapters(ctx, input)
 			if err != nil {
 				data.Error = appendErr(data.Error, "chapters 解析失败: "+err.Error())
 			} else {
@@ -175,7 +286,7 @@ func main() {
 
 		// 高级：Programs
 		if opt.EnablePrograms {
-			pgs, err := tool.ProbePrograms(ctx, input)
+			pgs, err := probeTool.ProbePrograms(ctx, input)
 			if err != nil {
 				data.Error = appendErr(data.Error, "programs 解析失败: "+err.Error())
 			} else {
@@ -188,8 +299,217 @@ func main() {
 		c.HTML(http.StatusOK, "index.html", data)
 	})
 
+	// --------------------- ffmpeg：开始任务 ---------------------
+	r.POST("/ffmpeg/start", func(c *gin.Context) {
+		// 输入源：上传优先
+		input, desc, cleanup, err := getInputFromRequest(c)
+		if err != nil {
+			c.HTML(http.StatusBadRequest, "index.html", PageData{OK: false, Error: err.Error()})
+			return
+		}
+
+		action := strings.TrimSpace(c.PostForm("action"))
+		outName := strings.TrimSpace(c.PostForm("out_name"))
+		crf := parseInt(c.PostForm("crf"), 23)
+		preset := strings.TrimSpace(c.PostForm("preset"))
+		if preset == "" {
+			preset = "medium"
+		}
+		abitrate := strings.TrimSpace(c.PostForm("abitrate"))
+		if abitrate == "" {
+			abitrate = "128k"
+		}
+		atSec, _ := strconv.ParseFloat(strings.TrimSpace(c.PostForm("at")), 64)
+		if atSec < 0 {
+			atSec = 0
+		}
+
+		if outName == "" {
+			switch action {
+			case "extract_aac":
+				outName = "out.aac"
+			case "snapshot":
+				outName = "shot.jpg"
+			case "remux":
+				outName = "out.mp4"
+			default:
+				outName = "out.mp4"
+			}
+		}
+
+		ext := filepath.Ext(outName)
+		if ext == "" {
+			ext = ".bin"
+		}
+
+		outFile, err := os.CreateTemp("", "ffout-*"+ext)
+		if err != nil {
+			if cleanup != nil {
+				cleanup()
+			}
+			c.HTML(http.StatusInternalServerError, "index.html", PageData{OK: false, Error: "创建输出文件失败: " + err.Error()})
+			return
+		}
+		_ = outFile.Close()
+
+		job := &FFJob{
+			ID:           newID(),
+			Status:       "created",
+			CreatedAt:    time.Now(),
+			InputPath:    input,
+			InputDesc:    desc,
+			InputCleanup: cleanup,
+			OutputPath:   outFile.Name(),
+			OutputName:   outName,
+		}
+		jobs.Put(job)
+
+		// 后台执行 ffmpeg
+		go func() {
+			defer func() {
+				// 清理上传临时输入
+				if job.InputCleanup != nil {
+					job.InputCleanup()
+				}
+				// 输出文件保留一段时间后清理，避免磁盘堆满
+				time.AfterFunc(30*time.Minute, func() {
+					_ = os.Remove(job.OutputPath)
+					jobs.Delete(job.ID)
+				})
+			}()
+
+			job.Status = "running"
+			job.broadcast(sseEvent{Event: "status", Data: "running"})
+
+			// 构建命令（按你的 ffmpeg preset）
+			var cmd *ffmpeg.FFmpegCommand
+			switch action {
+			case "extract_aac":
+				cmd = ffmpeg.PresetExtractAAC(job.InputPath, job.OutputPath, abitrate)
+			case "snapshot":
+				cmd = ffmpeg.PresetSnapshot(job.InputPath, job.OutputPath, atSec)
+			case "remux":
+				cmd = ffmpeg.PresetRemux(job.InputPath, job.OutputPath)
+			default:
+				cmd = ffmpeg.PresetTranscodeMP4H264AAC(job.InputPath, job.OutputPath, crf, preset)
+			}
+
+			// 执行 + progress
+			_, runErr := ffTool.RunWithProgress(context.Background(), cmd, func(p ffmpeg.FFmpegProgress) error {
+				b, _ := json.Marshal(map[string]any{
+					"frame":       p.Frame,
+					"fps":         p.FPS,
+					"out_time_ms": p.OutTimeMs,
+					"speed":       p.Speed,
+				})
+				job.broadcast(sseEvent{Event: "progress", Data: string(b)})
+				return nil
+			})
+
+			if runErr != nil {
+				job.Status = "error"
+				job.ErrText = runErr.Error()
+				job.broadcast(sseEvent{Event: "status", Data: "error"})
+				job.broadcast(sseEvent{Event: "fferror", Data: job.ErrText})
+				return
+			}
+
+			job.Status = "done"
+			job.broadcast(sseEvent{Event: "status", Data: "done"})
+			donePayload, _ := json.Marshal(map[string]any{
+				"download": "/ffmpeg/download/" + job.ID,
+				"name":     job.OutputName,
+			})
+			job.broadcast(sseEvent{Event: "done", Data: string(donePayload)})
+		}()
+
+		// 直接渲染同一页，让前端用 SSE 订阅 job
+		c.HTML(http.StatusOK, "index.html", PageData{
+			OK: true,
+			FFJob: &JobView{
+				ID:     job.ID,
+				Status: job.Status,
+			},
+		})
+	})
+
+	// --------------------- ffmpeg：SSE 事件流 ---------------------
+	r.GET("/ffmpeg/events/:id", func(c *gin.Context) {
+		id := c.Param("id")
+		job, ok := jobs.Get(id)
+		if !ok {
+			c.Status(http.StatusNotFound)
+			return
+		}
+
+		c.Header("Content-Type", "text/event-stream")
+		c.Header("Cache-Control", "no-cache")
+		c.Header("Connection", "keep-alive")
+
+		flusher, ok := c.Writer.(http.Flusher)
+		if !ok {
+			c.Status(http.StatusInternalServerError)
+			return
+		}
+
+		sub := job.subscribe()
+		defer job.unsubscribe(sub)
+
+		// 先发当前状态
+		writeSSE(c.Writer, "status", job.Status)
+		flusher.Flush()
+
+		for {
+			select {
+			case <-c.Request.Context().Done():
+				return
+			case ev := <-sub:
+				writeSSE(c.Writer, ev.Event, ev.Data)
+				flusher.Flush()
+				if ev.Event == "done" || ev.Event == "fferror" {
+					return
+				}
+			}
+		}
+	})
+
+	// --------------------- ffmpeg：下载输出 ---------------------
+	r.GET("/ffmpeg/download/:id", func(c *gin.Context) {
+		id := c.Param("id")
+		job, ok := jobs.Get(id)
+		if !ok {
+			c.String(http.StatusNotFound, "job not found")
+			return
+		}
+		if job.Status != "done" {
+			c.String(http.StatusBadRequest, "job not done")
+			return
+		}
+		c.Header("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, sanitizeFilename(job.OutputName)))
+		c.File(job.OutputPath)
+	})
+
 	log.Println("Listening on http://127.0.0.1:8080")
 	_ = r.Run(":8080")
+}
+
+func writeSSE(w io.Writer, event, data string) {
+	// SSE：event + data（多行 data 需拆行，这里简单替换换行）
+	data = strings.ReplaceAll(data, "\r", "")
+	data = strings.ReplaceAll(data, "\n", "\\n")
+	_, _ = fmt.Fprintf(w, "event: %s\n", event)
+	_, _ = fmt.Fprintf(w, "data: %s\n\n", data)
+}
+
+func sanitizeFilename(name string) string {
+	name = strings.ReplaceAll(name, `"`, "")
+	name = strings.ReplaceAll(name, "\n", "")
+	name = strings.ReplaceAll(name, "\r", "")
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "output.bin"
+	}
+	return name
 }
 
 func appendErr(existing, add string) string {
@@ -320,7 +640,7 @@ func parseInt(s string, def int) int {
 
 // --------------------- 基础信息 ViewModel ---------------------
 
-func buildProbeView(p *media.FFProbeJSON, source string, ver string) *ProbeView {
+func buildProbeView(p *ffprobe.FFProbeJSON, source string, ver string) *ProbeView {
 	v := p.FirstVideo()
 	a := p.FirstAudio()
 
@@ -433,11 +753,11 @@ func parseFloat(s string) float64 {
 
 // --------------------- 高级数据处理：限制/过滤/摘要 ---------------------
 
-func filterKeyFrames(in *media.FramesJSON) *media.FramesJSON {
+func filterKeyFrames(in *ffprobe.FramesJSON) *ffprobe.FramesJSON {
 	if in == nil {
 		return in
 	}
-	out := &media.FramesJSON{Frames: make([]media.Frame, 0, len(in.Frames))}
+	out := &ffprobe.FramesJSON{Frames: make([]ffprobe.Frame, 0, len(in.Frames))}
 	for _, f := range in.Frames {
 		if f.MediaType == "video" && f.KeyFrame == 1 {
 			out.Frames = append(out.Frames, f)
@@ -446,23 +766,23 @@ func filterKeyFrames(in *media.FramesJSON) *media.FramesJSON {
 	return out
 }
 
-func limitFrames(in *media.FramesJSON, limit int) *media.FramesJSON {
+func limitFrames(in *ffprobe.FramesJSON, limit int) *ffprobe.FramesJSON {
 	if in == nil || limit <= 0 || len(in.Frames) <= limit {
 		return in
 	}
-	out := &media.FramesJSON{Frames: append([]media.Frame(nil), in.Frames[:limit]...)}
+	out := &ffprobe.FramesJSON{Frames: append([]ffprobe.Frame(nil), in.Frames[:limit]...)}
 	return out
 }
 
-func limitPackets(in *media.PacketsJSON, limit int) *media.PacketsJSON {
+func limitPackets(in *ffprobe.PacketsJSON, limit int) *ffprobe.PacketsJSON {
 	if in == nil || limit <= 0 || len(in.Packets) <= limit {
 		return in
 	}
-	out := &media.PacketsJSON{Packets: append([]media.Packet(nil), in.Packets[:limit]...)}
+	out := &ffprobe.PacketsJSON{Packets: append([]ffprobe.Packet(nil), in.Packets[:limit]...)}
 	return out
 }
 
-func summarizeFrames(fr *media.FramesJSON) string {
+func summarizeFrames(fr *ffprobe.FramesJSON) string {
 	if fr == nil {
 		return ""
 	}
@@ -491,7 +811,7 @@ func summarizeFrames(fr *media.FramesJSON) string {
 	return msg
 }
 
-func summarizePackets(pk *media.PacketsJSON) string {
+func summarizePackets(pk *ffprobe.PacketsJSON) string {
 	if pk == nil {
 		return ""
 	}

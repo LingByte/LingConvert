@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"log"
 
-	media "github.com/LingByte/LingConvert"
+	media "github.com/LingByte/LingConvert/media/ffprobe"
 )
 
 func main() {

@@ -186,6 +186,132 @@
         {{ end }}
     </div>
     {{ end }}
+
+    <div class="card">
+        <h3>ffmpeg 操作</h3>
+        <div class="meta">支持：转码 MP4(H.264+AAC)、抽音频 AAC、截图、Remux。执行过程会显示进度（SSE）。</div>
+
+        <form action="/ffmpeg/start" method="post" enctype="multipart/form-data">
+            <!-- 输入源：复用和 /probe 同样的字段名 -->
+            <div class="row" style="margin-top:10px">
+                <div>
+                    <div class="meta">上传本地文件</div>
+                    <input type="file" name="file" />
+                </div>
+
+                <div style="flex:1">
+                    <div class="meta">或输入远程 URL</div>
+                    <input type="text" name="url" placeholder="https://example.com/video.mp4" />
+                </div>
+            </div>
+
+            <div class="sub" style="margin-top:12px">
+                <div class="opt">
+                    <label>操作：
+                        <select name="action" style="padding:10px;border-radius:10px;border:1px solid #ccc">
+                            <option value="transcode">转码 MP4（H.264 + AAC）</option>
+                            <option value="extract_aac">抽取音频 AAC</option>
+                            <option value="snapshot">视频截图（1 帧）</option>
+                            <option value="remux">Remux（不转码，换容器）</option>
+                        </select>
+                    </label>
+
+                    <label>输出文件名（可选）：
+                        <input type="text" name="out_name" placeholder="out.mp4 / out.aac / shot.jpg" style="width:240px">
+                    </label>
+                </div>
+
+                <div class="opt" style="margin-top:10px">
+                    <label>CRF：
+                        <input type="number" name="crf" value="23" min="0" max="51" style="width:120px">
+                    </label>
+                    <label>Preset：
+                        <input type="text" name="preset" value="medium" style="width:160px">
+                    </label>
+                    <label>音频码率：
+                        <input type="text" name="abitrate" value="128k" style="width:140px">
+                    </label>
+                    <label>截图时间点（秒）：
+                        <input type="number" name="at" value="1" min="0" step="0.1" style="width:140px">
+                    </label>
+                </div>
+
+                <div class="meta" style="margin-top:8px">
+                    提示：不同操作会用到不同参数（例如截图用 at，抽音频用 abitrate，转码用 crf/preset）。
+                </div>
+            </div>
+
+            <button type="submit" style="margin-top:12px">开始执行 ffmpeg</button>
+        </form>
+
+        {{ if .FFJob }}
+        <div class="sub" style="margin-top:14px">
+            <div class="meta">任务 ID：<b>{{ .FFJob.ID }}</b>（页面会自动接收进度）</div>
+
+            <div id="ff-status" class="meta" style="margin-top:8px">状态：{{ .FFJob.Status }}</div>
+            <div id="ff-progress" class="meta" style="margin-top:6px">进度：-</div>
+            <div id="ff-speed" class="meta" style="margin-top:6px">速度：-</div>
+
+            <div id="ff-error" class="err" style="margin-top:10px; display:none;"></div>
+
+            <div id="ff-download" style="margin-top:10px; display:none;">
+                <a id="ff-download-link" href="#" style="text-decoration:underline;">下载输出文件</a>
+            </div>
+        </div>
+
+        <script>
+            (function () {
+                const jobID = "{{ .FFJob.ID }}";
+                if (!jobID) return;
+
+                const st = document.getElementById("ff-status");
+                const pr = document.getElementById("ff-progress");
+                const sp = document.getElementById("ff-speed");
+                const er = document.getElementById("ff-error");
+                const dl = document.getElementById("ff-download");
+                const dlLink = document.getElementById("ff-download-link");
+
+                const es = new EventSource("/ffmpeg/events/" + encodeURIComponent(jobID));
+
+                es.addEventListener("status", (e) => {
+                    st.textContent = "状态：" + e.data;
+                });
+
+                es.addEventListener("progress", (e) => {
+                    // e.data 是 JSON 字符串
+                    try {
+                        const p = JSON.parse(e.data);
+                        pr.textContent = "进度：frame=" + (p.frame ?? "-") + ", out_time_ms=" + (p.out_time_ms ?? "-");
+                        sp.textContent = "速度：" + (p.speed ?? "-") + ", fps=" + (p.fps ?? "-");
+                    } catch (err) {
+                        // ignore
+                    }
+                });
+
+                es.addEventListener("done", (e) => {
+                    // e.data: {"download":"/ffmpeg/download/xxx","name":"out.mp4"}
+                    try {
+                        const d = JSON.parse(e.data);
+                        dl.style.display = "";
+                        dlLink.href = d.download;
+                        dlLink.textContent = "下载输出文件（" + (d.name || "download") + "）";
+                    } catch (err) {}
+                    es.close();
+                });
+
+                es.addEventListener("error", (e) => {
+                    // SSE 自带 error 事件不一定有 data；我们后端也会发 event:error
+                });
+
+                es.addEventListener("fferror", (e) => {
+                    er.style.display = "";
+                    er.textContent = "错误：\n" + e.data;
+                    es.close();
+                });
+            })();
+        </script>
+        {{ end }}
+    </div>
 </div>
 </body>
 </html>
